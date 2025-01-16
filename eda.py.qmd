@@ -11,6 +11,7 @@ format:
         embed-resources: true
 editor:
     render-on-save: true
+jupyter: python3
 ---
 
 ```{python}
@@ -79,4 +80,11 @@ duckdb.sql("""
     GROUP BY CO2_CUSTOMER
     ORDER BY COUNT(*) DESC
 """).show()
+```
+
+```{python}
+def greet(name):
+    print(f"Hello {name}")
+
+greet("Adam")
 ```
