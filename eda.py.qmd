@@ -15,10 +15,12 @@ jupyter: python3
 ---
 
 ```{python}
-import pandas as pd
+import polars as pl
 import duckdb
+import skimpy
+import folium
 
-from plotnine import ggplot, aes, geom_histogram
+from plotnine import ggplot, aes
 ```
 
 
@@ -36,7 +38,7 @@ transaction_data = 'data/transactional_data.csv'
 ```{python}
 # Load CSVs to persistent tables
 con.execute(f"""
-    CREATE TABLE cust_addr_zip_map AS (
+    CREATE TABLE cust_addr AS (
         SELECT * FROM read_csv_auto('{cust_addr_zip_map}')
     );
 
@@ -60,12 +62,27 @@ con.sql("SHOW TABLES")
 
 ### `customer_profile.csv`
 
+We can now use SQL to query the `cust_profile` table. In the case where we need some programming, we can just create a polars dataframe:
+
+```{python}
+cust_profile_df = con.sql("FROM cust_profile").pl()
+```
+
+Let's first look at the columns:
+
 ```{python}
 con.sql("DESCRIBE cust_profile")
 ```
 
+11 columns. All the data types seem reasonable. Let's assess sparcity of the data:
 
-How many groups/individual customers are there?
+```{python}
+cust_profile_df.null_count()
+```
+
+We have mostly categorical features in here. Let's determine some of the distributions of these, such as...
+
+How many groups/individual customers are there? (remember, many individual customers could roll up to a group)
 
 ```{python}
 con.sql("""
@@ -88,7 +105,7 @@ con.sql("""
 """)
 ```
 
-What kind of order frequency is seen across these 
+What kind of order frequency is seen across these?
 
 ```{python}
 con.sql("""
@@ -99,32 +116,170 @@ con.sql("""
 """)
 ```
 
-
 ```{python}
 con.sql("""
-    SELECT FREQUENT_ORDER_TYPE, COUNT(*) AS VOL
-    FROM 'data/customer_profile.csv'
-    GROUP BY FREQUENT_ORDER_TYPE
+    SELECT COLD_DRINK_CHANNEL, COUNT(*) AS VOL
+    FROM cust_profile
+    GROUP BY COLD_DRINK_CHANNEL
     ORDER BY COUNT(*) DESC
 """)
 ```
 
+We see mostly local market partners.
 
 ```{python}
 con.sql("""
     SELECT LOCAL_MARKET_PARTNER, COUNT(*) AS VOL
-    FROM 'data/customer_profile.csv'
+    FROM cust_profile
     GROUP BY LOCAL_MARKET_PARTNER
     ORDER BY COUNT(*) DESC
 """)
 ```
 
+However, if we intersect by group, there may be more to the story:
+
+```{python}
+con.sql("""
+    SELECT
+    LOCAL_MARKET_PARTNER,
+    SUM(CASE WHEN PRIMARY_GROUP_NUMBER IS NULL THEN 1 ELSE 0 END) AS CUST,
+    SUM(CASE WHEN PRIMARY_GROUP_NUMBER IS NULL THEN 0 ELSE 1 END) AS GROUP
+    FROM cust_profile
+    GROUP BY LOCAL_MARKET_PARTNER
+""")
+```
+
+Solo customers are far more likely to be local market partners (which makes sense).
+
+What is the distribution of buying CO2?
 
 ```{python}
 con.sql("""
     SELECT CO2_CUSTOMER, COUNT(*) AS VOL
-    FROM 'data/customer_profile.csv'
+    FROM cust_profile
     GROUP BY CO2_CUSTOMER
     ORDER BY COUNT(*) DESC
 """)
 ```
+
+It's about 50-50, but we see that "franchises" are far less likely to source their CO2 from Swire. So how valuable is that business?
+
+
+
+### `customer_address_and_zip_mapping.csv`
+
+Let's create our polars data frame:
+
+```{python}
+cust_addr_df = con.sql("FROM cust_addr").pl()
+```
+
+And now look at the columns:
+
+```{python}
+con.sql("DESCRIBE cust_addr")
+```
+
+We need to pull out those full addresses. We can do that by splitting the string, grabbing list elements of interest, and then properly casting.
+
+```{python}
+con.execute("""
+    CREATE TABLE cust_addr_detail AS (
+        SELECT
+        zip
+        ,LIST_ELEMENT(STRING_SPLIT("full address", ','), 2) AS city
+        ,LIST_ELEMENT(STRING_SPLIT("full address", ','), 3) AS state
+        ,LIST_ELEMENT(STRING_SPLIT("full address", ','), 4) AS state_abbr
+        ,LIST_ELEMENT(STRING_SPLIT("full address", ','), 5) AS county
+        ,CAST(LIST_ELEMENT(STRING_SPLIT("full address", ','), 7) AS DOUBLE) AS lat
+        ,CAST(LIST_ELEMENT(STRING_SPLIT("full address", ','), 8) AS DOUBLE) AS lon
+        FROM cust_addr
+    )
+""")
+```
+
+```{python}
+con.sql("DESCRIBE cust_addr_detail")
+```
+
+Looks great! Let's join and see where most customers are by state.
+
+```{python}
+con.sql("""
+    SELECT 
+    cad.state
+    ,COUNT(*)
+    FROM cust_profile cp
+    INNER JOIN cust_addr_detail cad ON cad.zip = cp.ZIP_CODE
+    GROUP BY cad.state
+""")
+```
+
+It appears that most customers are found in Massachusetts. Let's see if we can't render a map:
+
+```{python}
+cust_addr = con.sql("SELECT * FROM cust_addr_detail").pl()
+```
+
+```{python}
+swire_map = folium.Map(
+    location = [
+        cust_addr['lat'].mean(),
+        cust_addr['lon'].mean()
+    ],
+    zoom_start = 2.75, 
+    control_scale = True
+)
+```
+
+```{python}
+for row in cust_addr.iter_rows():
+    folium.Marker(
+        location = [row[5], row[6]], 
+        icon = folium.Icon(color = "red")
+    ).add_to(swire_map)
+```
+
+```{python}
+swire_map
+```
+
+There is somewhat more concentraction around city centers, but not near what I would expect. Seems curious.
+
+
+
+### `transactional_data.csv`
+
+Let's create our polars data frame:
+
+```{python}
+transac_df = con.sql("FROM transactions").pl()
+```
+
+And now look at the columns:
+
+```{python}
+con.sql("DESCRIBE transactions")
+```
+
+Let's look at the summary statistics here:
+
+```{python}
+transac_df.describe()
+```
+
+No missing data, which is very good. Most customers aren't ordering anything or very little on a per transaction date basis. Let's evaluate on an annual basis.
+
+```{python}
+con.sql("""
+    SELECT
+    YEAR
+    ,CUSTOMER_NUMBER
+    ,SUM(ORDERED_CASES) + SUM(ORDERED_GALLONS) AS ORDERED_QTY
+    FROM transactions
+    GROUP BY
+    YEAR, CUSTOMER_NUMBER
+""").pl().describe()
+```
+
+We get our first glimpse at why there's the annual 400 gallon threshold. Over 2/3 aren't ordering that much. Woof.
